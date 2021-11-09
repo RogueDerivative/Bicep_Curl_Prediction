@@ -1,0 +1,384 @@
+---
+title: "Bicep Curl Prediction"
+author: "Nate Foulkes"
+date: "10/24/2021"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+# Assignment description  
+One thing that people regularly do is quantify how  much of a particular activity they do, but they rarely quantify how well they do it. In this project, the goal will be to use data from accelerometers on the belt, forearm, arm, and dumbbell of 6 participants who each performed a bicep curl in 5 different ways. The goal is to find a quality predictive algorithm.  
+Using the caret and parsnip packages. The process created two different methods of pre-process (i.e. normalized and PCA). Then created three models: tree, generalized linear, and random forest. Build workflows combing each pre-process and model. Look at the metrics of each model. Eliminate poor performing models. Resample then retrain the better performing models to try and improve the fit. Finally apply the best fitting model to the unseen testing data.  
+
+```{r setup, include=FALSE,echo=TRUE,cache=TRUE, warning=FALSE}
+if(!file.exists("./data")){dir.create("./data")}
+url1 <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+#download.file(url1, destfile = "./data/pml-training.csv")
+url2 <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+#download.file(url2, destfile = "./data/pml-testing.csv")
+## Data Source
+website <- "http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har. "
+```  
+
+```{r libraries, include=FALSE,echo=TRUE,cache=TRUE, warning=FALSE}
+# libraries used
+library(tidyverse) #*
+library(caret)#*
+library(tidymodels) #* for the dials fuction
+library(parsnip)#*
+library(recipes)#*
+library(workflows)#*
+library(yardstick)#* for the roc_auc
+```  
+
+
+# What to use as predictors:  
+```{r pre-process, echo=TRUE,cache=TRUE,warning=FALSE,include=FALSE}
+# read in the data files
+pml_test <- read_csv("./data/pml-testing.csv")
+pml_train <- read_csv("./data/pml-training.csv") 
+# making NA explicit
+pml_test <- pml_test %>% complete(.)
+pml_train <- pml_train %>% complete(.)
+# Remove the columns with more than 90% NA values
+pml_test <- 
+        pml_test[,!sapply(pml_test, 
+                function(x) mean(is.na(x)))>0.9]
+pml_train <- 
+        pml_train[,!sapply(pml_train,
+                function(x) mean(is.na(x)))>0.9]
+# convert classe and user_name into factors
+pml_train$classe <- 
+        parse_factor(pml_train$classe, 
+                     levels = c("A","B","C","D","E"), 
+                     ordered = FALSE)
+pml_train$user_name <-
+        parse_factor(pml_train$user_name, 
+                     levels = c("carlitos", "pedro","adelmo",
+                                "charles","eurico","jeremy"),
+                     ordered = FALSE)
+pml_test$user_name <-
+        parse_factor(pml_test$user_name, 
+                     levels = c("carlitos", "pedro","adelmo",
+                                "charles","eurico","jeremy"),
+                     ordered = FALSE)
+# get rid of the index, time, and window cols
+pml_test <- 
+        pml_test %>% 
+        select(-(...1 | raw_timestamp_part_1:num_window))
+pml_train <- 
+        pml_train %>% 
+        select(-(...1 | raw_timestamp_part_1:num_window))
+```  
+
+The original files are read-in using read_csv function. After examining the structure of the data there appeared to be a large proportion of missing values. It was judged that those columns are summary values of other columns, were not necessary, and were immediately cut from the data set.  
+```{r heatmap, include=TRUE, warning=FALSE, echo=FALSE,cache=TRUE,fig.height=1.5, fig.width=3, eval=TRUE}
+# image of user versus classe
+pml_train %>% count(classe, user_name) %>%
+        ggplot(mapping = aes(x=classe,y=user_name)) +
+        geom_tile(mapping = aes(fill=n))
+```  
+  
+The heat map above doesn't suggest that there is a significant skew to the data when comparing the category of type of bicep curl to participant.  
+
+## Recipes  
+The norm_center_recipe changed nominal values into dummy variables, looked for "near zero variance" in each of the predictors, and normalized each numeric predictor. The pca_recipe used the the method of Principal Component Analysis (and changed nominal predictors to dummy variables).  
+```{r recipe,echo=TRUE,cache=TRUE,warning=FALSE,include=FALSE, eval=TRUE}
+# Normalized Recipe
+norm_center_recipe <-
+        recipe(classe ~ ., data = pml_train) %>%
+        step_dummy(all_nominal_predictors()) %>%
+        step_nzv(all_predictors()) %>%
+        step_normalize(all_numeric_predictors())
+# Principal Component Analysis Recipe
+pca_recipe <-
+        recipe(classe ~., data = pml_train) %>%
+        step_dummy(all_nominal_predictors()) %>%
+        step_pca(all_numeric_predictors(), num_comp = 4)
+```  
+
+# Algorithms  
+We analyzed the training data using three different methods: multinomial regression, a tree model, and a random forest model. Each model was run twice: once with the normalized and centered recipe, and then again with the PCA recipe. Once the models were fit to the training data we examined the ROC and AUC values. Models with low ROC and AUC were eliminated from the prediction model. Those with high values of ROC and AUC were then resampled to try and improve the fit.  
+The receiver operating characteristic curve (ROC) is used for assessing the tradeoff between sensitivity and specificity. 
+
+### Resampling methods  
+Once we found methods that offered decent results those methods were resampled to find a better prediction model. The resampling was done using cross validation for the tree model and repeated cross validation for the random forest.  
+
+```{r resample methods, echo=TRUE,cache=TRUE, warning=FALSE,include=FALSE, eval=TRUE}
+# used to create the AUC plots
+keep_pred <- control_resamples(save_pred = TRUE, save_workflow = FALSE)
+## Cross-Validation
+set.seed(42)
+pml_folds <- vfold_cv(pml_train, v=5) # used in tree resample
+## Repeated Cross-Validation
+r_cv <- vfold_cv(pml_train, v = 5, repeats = 5) # used in randf resample
+```
+
+## Multinomial Regression  
+The regression used the glmnet engine: a parsnip package that fits a generalized linear model via penalized maximum likelihood. From previous analysis it seemed reasonable to set the penalty to 0.1. So those predictors with penalty coefficients larger than 0.1 were minimized in the final regression.
+```{r mr, echo=TRUE,cache=TRUE,warning=FALSE, include=FALSE}
+# multinomial model
+mr_model <- 
+        multinom_reg(penalty = 0.1) %>%
+        set_engine("glmnet") %>%
+        set_mode("classification")
+# Normalized and Centered
+mr_workflow_nc <-
+        workflow() %>%
+        add_model(mr_model) %>%
+        add_recipe(norm_center_recipe)
+# Fit the mr nc model
+set.seed(234)
+mr_fit_nc <- 
+        mr_workflow_nc %>%
+        fit(data = pml_train)
+# Predict using the norm center model
+mr_training_pred_nc <- 
+        predict(mr_fit_nc, pml_train) %>%
+        bind_cols(predict(mr_fit_nc, pml_train, type = "prob")) %>%
+        bind_cols(pml_train %>% select(classe))
+## Check the quality of fit
+mr_nc_roc_auc <- 
+        mr_training_pred_nc %>%
+        roc_auc(truth = pml_train$classe,
+                .pred_A, .pred_B, .pred_C, .pred_D, .pred_E)
+mr_nc_accuracy <-
+        mr_training_pred_nc %>%
+        accuracy(truth = pml_train$classe, .pred_class)
+mr_nc_est <- 
+        round(mr_nc_roc_auc$.estimate,3)
+# multinomial PCA
+mr_workflow_pca <- 
+        workflow() %>%
+        add_model(mr_model) %>%
+        add_recipe(pca_recipe)
+## fit the pca model
+set.seed(234)
+mr_fit_pca <- 
+        mr_workflow_pca %>%
+        fit(data = pml_train)
+## predict with the pca model
+mr_training_pred_pca <- 
+        predict(mr_fit_pca, pml_train) %>%
+        bind_cols(predict(mr_fit_pca, pml_train, type = "prob")) %>%
+        bind_cols(pml_train %>% select(classe))
+## Check the quality of fit
+mr_pca_roc_auc <-
+        mr_training_pred_pca %>%
+        roc_auc(truth = pml_train$classe,
+                .pred_A, .pred_B, 
+                .pred_C, .pred_D, .pred_E)
+mr_pca_accuracy <- 
+        mr_training_pred_pca %>%
+        accuracy(truth = pml_train$classe, .pred_class)
+mr_pca_estimate <- 
+        round(mr_pca_roc_auc$.estimate,3)
+```  
+The multinomial regression was not a great fit for either type of pre-processing. The PCA AUC was only `r mr_pca_estimate` and the Normalized AUC was `r mr_nc_est`. 
+  
+## Tree Model  
+Decision Tree models are created using 2 steps: Induction and Pruning. Induction is where we actually build the tree i.e set all of the hierarchical decision boundaries based on our data. Because of the nature of training decision trees they can be prone to major overfitting. Pruning is the process of removing the unnecessary structure from a decision tree, effectively reducing the complexity to combat overfitting with the added bonus of making it even easier to interpret.  
+```{r tree,echo=TRUE,cache=TRUE,warning=FALSE, include=FALSE}
+# Tree model
+tune_spec <- 
+        decision_tree(cost_complexity = 0.02,
+                      tree_depth = 10,
+                      min_n = 1000) %>%
+        set_engine("rpart") %>%
+        set_mode("classification")
+# Normalized and Centered
+tree_wf_nc <- 
+        workflow() %>%
+        add_model(tune_spec) %>%
+        add_recipe(norm_center_recipe)
+# fit the tree norm center recipe
+set.seed(234)
+tree_fit_nc <- 
+        tree_wf_nc %>%
+        fit(data=pml_train)
+# Predict tree using the norm center model
+tree_pred_nc <- 
+        predict(tree_fit_nc, pml_train) %>%
+        bind_cols(predict(tree_fit_nc, pml_train, type = "prob")) %>%
+        bind_cols(pml_train %>% select(classe))
+## Check quality of fit
+tree_nc_roc_auc <-
+        tree_pred_nc %>%
+        roc_auc(truth = pml_train$classe, 
+                .pred_A, .pred_B, .pred_C, .pred_D, .pred_E)
+tree_nc_accuracy <-
+        tree_pred_nc %>%
+        accuracy(truth = pml_train$classe, .pred_class)
+tree_nc_est <- 
+        round(tree_nc_roc_auc$.estimate,3)
+# PCA
+tree_wf_pca <-
+        workflow() %>%
+        add_model(tune_spec) %>%
+        add_recipe(pca_recipe)
+# Fit tree using the pca recipe
+set.seed(567)
+tree_fit_pca <- 
+        tree_wf_pca %>%
+        fit(data=pml_train)
+# Predict tree using the pca recipe
+tree_pred_pca <- 
+        predict(tree_fit_pca, pml_train) %>%
+        bind_cols(predict(tree_fit_pca, pml_train, type = "prob")) %>%
+        bind_cols(pml_train %>% select(classe))
+tree_pca_roc_auc <-
+        tree_pred_pca %>%
+        roc_auc(truth = pml_train$classe,
+                .pred_A, .pred_B, .pred_C, .pred_D, .pred_E)
+tree_pca_accuracy <-
+        tree_pred_pca %>%
+        accuracy(truth = pml_train$classe, .pred_class)
+tree_pca_est <- 
+        round(tree_pca_roc_auc$.estimate, 3)
+```  
+The tree model gave better estimates of prediction compared to the multinomial regression. The Normalized estimate was `r tree_nc_est` and the PCA estimate was `r tree_pca_est`.  
+
+## Random Forest Model  
+The random forest is an extension upon the tree model. However, the difference is that a forest makes a large number of relatively uncorrelated trees to operate like a committee to create the models.  
+```{r rf,echo=TRUE,cache=TRUE,warning=FALSE, include=FALSE}
+# Random Forest model
+randf_model <- 
+        rand_forest(mtry = 5, trees = 10) %>%
+        set_engine("ranger", importance = "impurity") %>%
+        set_mode("classification")
+# Train PCA
+randf_wf_pca <-
+        workflow() %>%
+        add_model(randf_model) %>%
+        add_recipe(pca_recipe)
+## Fit the PCA
+set.seed(567)
+randf_fit_pca <- 
+        randf_wf_pca %>%
+        fit(data=pml_train)
+# Predict randf using the pca recipe
+randf_pred_pca <- 
+        predict(randf_fit_pca, pml_train) %>%
+        bind_cols(predict(randf_fit_pca, pml_train, type = "prob")) %>%
+        bind_cols(pml_train %>% select(classe))
+## Check quality of fit
+randf_pca_roc_auc <-
+        randf_pred_pca %>%
+        roc_auc(truth = pml_train$classe,
+                .pred_A, .pred_B, .pred_C, .pred_D, .pred_E)
+randf_pca_accuracy <-
+        randf_pred_pca %>%
+        accuracy(truth = pml_train$classe, .pred_class)
+randf_pca_est <- 
+        round(randf_pca_roc_auc$.estimate, 3)
+# Normalized and Centered
+randf_wf_nc <-
+        workflow() %>%
+        add_model(randf_model) %>%
+        add_recipe(norm_center_recipe)
+## Fit Random Forest Normalized and Centered
+set.seed(234)
+randf_fit_nc <- 
+        randf_wf_nc %>%
+        fit(data=pml_train)
+## Predict using the randf norm center model
+randf_pred_nc <- 
+        predict(randf_fit_nc, pml_train) %>%
+        bind_cols(predict(randf_fit_nc, pml_train, type = "prob")) %>%
+        bind_cols(pml_train %>% select(classe))
+## Check quality of fit
+randf_nc_roc_auc <-
+        randf_pred_nc %>%
+        roc_auc(truth = pml_train$classe,
+                .pred_A, .pred_B, .pred_C, .pred_D, .pred_E)
+randf_nc_accuracy <-
+        randf_pred_nc %>%
+        accuracy(truth = pml_train$classe, .pred_class)
+randf_nc_est <- 
+        round(randf_nc_roc_auc$.estimate, 3)
+```  
+The random forest models gave the best estimates. The PCA estimate was `r randf_pca_est` and the Normalized estimate was `r randf_nc_est`. At this point I would of chosen to use the PCA model - or at least change the pre-processing and resampling functions to try get a better fit using the PCA. Getting an estimate of 1 in the random forest normalized model should raise alarm bells. 
+
+# Resample the better models  
+```{r resample,echo=TRUE,cache=TRUE,warning=FALSE, include=FALSE}
+## Resampled Tree
+tree_grid <-
+        grid_regular(cost_complexity(),
+                     tree_depth(),
+                     levels = 5)
+tree_res_cv <-
+        tree_wf_nc %>%
+        fit_resamples(pml_folds, control = keep_pred)
+which_best <- 
+        tree_res_cv %>% 
+        show_best("accuracy")
+best_tree <- 
+        tree_res_cv %>%
+        select_best("accuracy")
+tree_nc_auc <-
+        tree_res_cv %>%
+        collect_predictions(parameters = best_tree) %>%
+        roc_curve(classe, 
+                  .pred_A, .pred_B, .pred_C, 
+                  .pred_D, .pred_E) %>%
+        mutate(model = "Tree")
+## Resampled  random forest
+set.seed(345)
+randf_pca_res <- 
+        randf_wf_pca %>%
+        tune_grid(r_cv,
+                  grid = 25,
+                  control = control_grid(save_pred = TRUE),
+                  metrics = metric_set(roc_auc))
+randf_pca_res %>% show_best(metric = "roc_auc")
+randf_pca_best <- 
+        randf_pca_res %>%
+        select_best(metric = "roc_auc")
+randf_pca_auc <-
+        randf_pca_res %>%
+        collect_predictions(parameters = randf_pca_best) %>%
+        roc_curve(classe, .pred_A, .pred_B, .pred_C, .pred_D, .pred_E) %>%
+        mutate(model = "Random Forest")
+```  
+Since the tree and random forest models seemed to give the better predictive models those models were resampled using cross-validation and the repeated cross-validation methods. Below you can visualize the predictive capabilities of each model. The graph shows that the random forest model is a better predictor than the tree model.
+
+### AUC Plots
+```{r auc plots, include=TRUE, warning=FALSE, echo=FALSE,cache=TRUE,fig.height=2, fig.width=8, eval=TRUE}
+# AUC plot
+bind_rows(randf_pca_auc, tree_nc_auc) %>% 
+        ggplot(aes(x = 1 - specificity, 
+                   y = sensitivity, col = model)) + 
+        geom_path(lwd = 1.5, alpha = 0.8) +
+        geom_abline(lty = 3) + 
+        coord_equal() + 
+        scale_color_viridis_d(option = "plasma", end = .6)
+```  
+
+# Test the predictors:  
+```{r test, echo=TRUE,cache=TRUE,warning=FALSE,include=FALSE}
+## Test PCA Random Forest model
+randf_pca_fit <- fit(randf_wf_pca, data = pml_train)
+final_randf_pca_predict <-
+        bind_cols(
+        predict(randf_pca_fit, pml_test),
+        predict(randf_pca_fit, pml_test, type = "prob"))
+randf_pca_test_table <-
+        final_randf_pca_predict
+## Test the randf norm center model
+randf_nc_fit <- fit(randf_wf_nc, data = pml_train)
+final_randf_nc_predict <-
+        bind_cols(
+        predict(randf_nc_fit, pml_test),
+        predict(randf_nc_fit, pml_test, type = "prob"))
+randf_nc_test_table <-
+        final_randf_nc_predict
+```  
+Using the random forest normalized model on the test data gives:
+```{r randf_nc_table}
+knitr::kable(randf_nc_test_table$.pred_class, caption = 'Test Data Prediction')
+```
+# Appendix: r code   
+```{r ref.label=knitr::all_labels(), echo = T, eval = F}
+
+```
