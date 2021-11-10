@@ -1,0 +1,378 @@
+---
+title: "Bicep_Curl_Pred"
+author: "Nate Foulkes"
+date: "11/9/2021"
+output: html_document
+---
+# Assignment description  
+One thing that people regularly do is quantify how  much of a particular activity they do, but they rarely quantify how well they do it. In this project, the goal will be to use data from accelerometers on the belt, forearm, arm, and dumbbell of 6 participants who each performed a bicep curl in 5 different ways. The goal is to find a quality predictive algorithm.  
+Using the caret and parsnip packages. The process created two different methods of pre-process (i.e. normalized and PCA). Then created three models: tree, generalized linear, and random forest. Build workflows combing each pre-process and model. Look at the metrics of each model. Eliminate poor performing models. Finally apply the best fitting model to the unseen testing data.  
+
+## 1. The question: with the given dataset can we create a model that correctly classifies the 5 different bicep curl movements?  
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+```  
+```{r libraries, include=FALSE}
+## libraries
+library(tidyverse) #*
+library(caret)#*
+library(tidymodels) #* for the dials fuction
+library(parsnip)#*
+library(recipes)#*
+library(workflows)#*
+library(yardstick)#* for the roc_auc
+library(vip)
+library(knitr)
+```  
+
+## 2. Input Data  
+This data is from:
+Ugulino, W.; Cardador, D.; Vega, K.; Velloso, E.; Milidiu, R.; Fuks, H. Wearable Computing: Accelerometers' Data Classification of Body Postures and Movements. Proceedings of 21st Brazilian Symposium on Artificial Intelligence. Advances in Artificial Intelligence - SBIA 2012. In: Lecture Notes in Computer Science. , pp. 52-61. Curitiba, PR: Springer Berlin / Heidelberg, 2012. ISBN 978-3-642-34458-9. DOI: 10.1007/978-3-642-34459-6_6.
+Cited by 2 (Google Scholar)
+
+Read more: http://groupware.les.inf.puc-rio.br/har.#ixzz4tofRpJYs
+
+```{r data, include = FALSE}
+# Data urls
+if(!file.exists("./data")){dir.create("./data")}
+url1 <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+#download.file(url1, destfile = "./data/pml-training.csv")
+url2 <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+#download.file(url2, destfile = "./data/pml-testing.csv")
+## Data Source
+website <- "http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har."
+validation <- read_csv("./data/pml-testing.csv")
+df <- read_csv("./data/pml-training.csv")
+```  
+
+## 3. Features: what to use as predictors
+Looking at the original data we see alot of NA values. The participant might make a difference so turn user_name into factors. Am not going to use time slices so we can drop the time columns.  
+Using the Parsnip package I created two different recipes to pre-process the data. The first recipe was to normalize the data: to account for any variables that might of had a large variance by centering them around zero and giving them a standard deviation of one. The normalized pre-process also looks for and eliminates any predictors that have a variance really close to zero. The second recipe uses the Principal Component Analysis (pca in the rest of the code). Both recipes convert the user_name predictor into a dummy variable.  
+
+```{r features, include = FALSE}
+# making NA explicit
+df <- df %>% complete(.)
+# Remove the columns with more than 90% NA values
+df <- 
+        df[,!sapply(df,
+                           function(x) mean(is.na(x)))>0.9]
+# convert user_name into factors
+df$user_name <-
+        parse_factor(df$user_name, 
+                     levels = c("carlitos", "pedro","adelmo",
+                                "charles","eurico","jeremy"),
+                     ordered = FALSE)
+# get rid of the index, time, and window cols
+df <- 
+        df %>% 
+        select(-(...1 | raw_timestamp_part_1:num_window))
+# Split the Data
+inTrain = createDataPartition(df$classe, p = 0.8, list = FALSE)
+training <- df[inTrain,]
+testing <- df[-inTrain,]
+# Convert classe into factors
+training$classe <- 
+        parse_factor(training$classe, 
+                     levels = c("A","B","C","D","E"), 
+                     ordered = FALSE)
+testing$classe <- 
+        parse_factor(testing$classe, 
+                     levels = c("A","B","C","D","E"), 
+                     ordered = FALSE)
+## Recipes 
+norm_recipe <-
+        recipe(classe ~ ., data = training) %>%
+        step_dummy(all_nominal_predictors()) %>%
+        step_nzv(all_predictors()) %>%
+        step_normalize(all_numeric_predictors())
+# Principal Component Analysis Recipe
+pca_recipe <-
+        recipe(classe ~., data = training) %>%
+        step_dummy(all_nominal_predictors()) %>%
+        step_pca(all_numeric_predictors(), num_comp = 4)
+```  
+
+## 4. Algorithms  
+
+The training data was analyzed using three different methods: multinomial regression, a tree model, and a random forest model. Each model was run twice: once with the normalized and recipe, and again with the PCA recipe.  
+```{r algorithms, include = FALSE}
+## Multinomial Regression  
+mr_model <- 
+        multinom_reg(penalty = 0.1) %>%
+        set_engine("glmnet") %>%
+        set_mode("classification")
+# Normalized and Centered
+mr_workflow_n <-
+        workflow() %>%
+        add_model(mr_model) %>%
+        add_recipe(norm_recipe)
+# Fit the mr n model
+set.seed(234)
+mr_fit_n <- 
+        mr_workflow_n %>%
+        fit(data = training)
+# Multinomial pca
+mr_workflow_pca <- 
+        workflow() %>%
+        add_model(mr_model) %>%
+        add_recipe(pca_recipe)
+## Fit the Mutlinomial pca model
+set.seed(234)
+mr_fit_pca <- 
+        mr_workflow_pca %>%
+        fit(data = training)
+## Tree Model
+tune_spec <- 
+        decision_tree(cost_complexity = 0.02,
+                      tree_depth = 10,
+                      min_n = 1000) %>%
+        set_engine("rpart") %>%
+        set_mode("classification")
+# Normalized Tree
+tree_wf_n <- 
+        workflow() %>%
+        add_model(tune_spec) %>%
+        add_recipe(norm_recipe)
+# Fit the Normalized Tree
+set.seed(234)
+tree_fit_n <- 
+        tree_wf_n %>%
+        fit(data=training)
+# Tree pca
+tree_wf_pca <-
+        workflow() %>%
+        add_model(tune_spec) %>%
+        add_recipe(pca_recipe)
+# Fit Tree pca
+set.seed(567)
+tree_fit_pca <- 
+        tree_wf_pca %>%
+        fit(data=training)
+## Random Forest Model
+randf_model <- 
+        rand_forest(mtry = 5, trees = 10) %>%
+        set_engine("ranger", importance = "impurity") %>%
+        set_mode("classification")
+# Random Forest pca
+randf_wf_pca <-
+        workflow() %>%
+        add_model(randf_model) %>%
+        add_recipe(pca_recipe)
+## Fit the Random Forest pca
+set.seed(567)
+randf_fit_pca <- 
+        randf_wf_pca %>%
+        fit(data=training)
+# Normalized Random Forest
+randf_wf_n <-
+        workflow() %>%
+        add_model(randf_model) %>%
+        add_recipe(norm_recipe)
+## Fit Normalized Random Forest
+set.seed(234)
+randf_fit_n <- 
+        randf_wf_n %>%
+        fit(data=training)
+```  
+
+## 5. Parameters - which predictors were used?  
+
+```{r parameters, include = FALSE}
+mr_n_vip <- mr_fit_n %>%
+        extract_fit_parsnip() %>%
+        vip()
+mr_n_vip$data
+mr_pca_vip <- mr_fit_pca %>%
+        extract_fit_parsnip() %>%
+        vip()
+mr_pca_vip$data
+tree_n_vip <- tree_fit_n %>%
+        extract_fit_parsnip() %>%
+        vip()
+tree_pca_vip <- tree_fit_pca %>%
+        extract_fit_parsnip() %>%
+        vip()
+randf_n_vip <- randf_fit_n %>%
+        extract_fit_parsnip() %>%
+        vip()
+randf_pca_vip <- randf_fit_pca %>%
+        extract_fit_parsnip() %>%
+        vip()
+```  
+Multinomial regression important predictors:  
+
+```{r mr_vip, eval=TRUE,include=FALSE}
+mr_vip_n <- knitr::kable(mr_n_vip$data, caption = "Normalized")
+mr_vip_pca <- knitr::kable(mr_pca_vip$data, caption = "PCA")
+```  
+`r mr_vip_n`  
+`r mr_vip_pca`  
+
+Tree method important predictors:  
+
+```{r tree_vip,eval=TRUE, include=FALSE}
+tree_vip_n <- knitr::kable(tree_n_vip$data, caption = "Normalized")
+tree_vip_pca <- knitr::kable(tree_pca_vip$data, caption = "PCA")
+```  
+`r tree_vip_n`  
+`r tree_vip_pca`  
+
+Random Forest important predictors:  
+
+```{r randf_vip, include=FALSE}
+randf_vip_n <- knitr::kable(randf_n_vip$data, caption = "Normalized")
+randf_vip_pca <- knitr::kable(randf_pca_vip$data, caption = "PCA")
+```  
+`r randf_vip_n`  
+`r randf_vip_pca`  
+
+## 6. How good were the models?
+```{r predict, include = FALSE}
+# Predict using the norm center model
+mr_pred_n <- 
+        predict(mr_fit_n, testing) %>%
+        bind_cols(predict(mr_fit_n, testing, type = "prob")) %>%
+        bind_cols(testing %>% select(classe))
+# Check the quality of fit
+mr_n_roc_auc <- 
+        mr_pred_n %>%
+        roc_auc(truth = testing$classe,
+                .pred_A, .pred_B, .pred_C, .pred_D, .pred_E)
+mr_n_roc_auc_est <- round(mr_n_roc_auc$.estimate,3)
+mr_n_accuracy <-
+        mr_pred_n %>%
+        accuracy(truth = testing$classe, .pred_class)
+mr_n_acc_est <- round(mr_n_accuracy$.estimate, 3)
+## predict with the mr pca model
+mr_pred_pca <- 
+        predict(mr_fit_pca, testing) %>%
+        bind_cols(predict(mr_fit_pca, testing, type = "prob")) %>%
+        bind_cols(testing %>% select(classe))
+## Check the quality of fit
+mr_pca_roc_auc <-
+        mr_pred_pca %>%
+        roc_auc(truth = testing$classe,
+                .pred_A, .pred_B, .pred_C, .pred_D, .pred_E)
+mr_pca_accuracy <- 
+        mr_pred_pca %>%
+        accuracy(truth = testing$classe, .pred_class)
+mr_pca_roc_auc_est <- round(mr_pca_roc_auc$.estimate,3)
+mr_pca_acc_est <- round(mr_pca_accuracy$.estimate ,3)
+# Predict tree using the norm center model
+tree_pred_n <- 
+        predict(tree_fit_n, testing) %>%
+        bind_cols(predict(tree_fit_n, testing, type = "prob")) %>%
+        bind_cols(testing %>% select(classe))
+## Check quality of fit
+tree_n_roc_auc <-
+        tree_pred_n %>%
+        roc_auc(truth = testing$classe, 
+                .pred_A, .pred_B, .pred_C, .pred_D, .pred_E)
+tree_n_roc_auc_est <- round(tree_n_roc_auc$.estimate, 3)
+tree_n_accuracy <-
+        tree_pred_n %>%
+        accuracy(truth = testing$classe, .pred_class)
+tree_n_acc_est <- round(tree_n_accuracy$.estimate, 3)
+# Predict tree using the pca recipe
+tree_pred_pca <- 
+        predict(tree_fit_pca, testing) %>%
+        bind_cols(predict(tree_fit_pca, testing, type = "prob")) %>%
+        bind_cols(testing %>% select(classe))
+tree_pca_roc_auc <-
+        tree_pred_pca %>%
+        roc_auc(truth = testing$classe,
+                .pred_A, .pred_B, .pred_C, .pred_D, .pred_E)
+tree_pca_roc_auc_est <- round(tree_pca_roc_auc$.estimate, 3)
+tree_pca_accuracy <-
+        tree_pred_pca %>%
+        accuracy(truth = testing$classe, .pred_class)
+tree_pca_acc_est <- round(tree_pca_accuracy$.estimate, 3)
+# Predict randf using the pca recipe
+randf_predict_pca <- 
+        predict(randf_fit_pca, testing) %>%
+        bind_cols(predict(randf_fit_pca, testing, type = "prob")) %>%
+        bind_cols(testing %>% select(classe))
+## Check quality of fit
+randf_pca_cm <- 
+        confusionMatrix(randf_predict_pca$classe , testing$classe)
+randf_pca_roc_auc <-
+        randf_predict_pca %>%
+        roc_auc(truth = testing$classe,
+                .pred_A, .pred_B, .pred_C, .pred_D, .pred_E)
+randf_pca_roc_auc_est <- 
+        round(randf_pca_roc_auc$.estimate, 3)
+randf_pca_accuracy <-
+        randf_predict_pca %>%
+        accuracy(truth = testing$classe, .pred_class)
+randf_pca_acc_est <- 
+        round(randf_pca_accuracy$.estimate, 3)
+## Predict using the Normailzed Random Forest----------------------------------
+randf_pred_n <- 
+        predict(randf_fit_n, testing) %>%
+        bind_cols(predict(randf_fit_n, testing, type = "prob")) %>%
+        bind_cols(testing %>% select(classe))
+## Check quality of fit
+randf_n_roc_auc <-
+        randf_pred_n %>%
+        roc_auc(truth = testing$classe,
+                .pred_A, .pred_B, .pred_C, .pred_D, .pred_E)
+randf_n_accuracy <-
+        randf_pred_n %>%
+        accuracy(truth = testing$classe, .pred_class)
+randf_n_est <-
+        round(randf_n_roc_auc$.estimate, 3)
+randf_n_acc_est <-
+        round(randf_n_accuracy$.estimate, 3)
+```  
+
+Given here is the Receiver Operating Characteristic (the ROC value) for each of the 6 models. The first line is the normalized pre-process and the second line is the principal component.  
+
+```{r estimates, include = FALSE}
+# Tables of estimate values
+my_roc_auc_table <- knitr::kable(data.frame(ROC_AUC_estimate = c("Normalized", "PCA"),
+                Multinomial = c(mr_n_roc_auc_est, mr_pca_roc_auc_est),
+                Tree = c(tree_n_roc_auc_est, tree_pca_roc_auc_est),
+                Random_Forest = c(randf_n_est,randf_pca_roc_auc_est)),
+                caption = "ROC Values")
+```  
+`r my_roc_auc_table`  
+  
+In this table we see that the normalized random forest model provides the largest confidence that it would give the the smallest out-of-sample error. Pause should be given though because of such a high value, and consideration should be made that possibly re-sampling the other methods might provide a better prediction on the validation data.  
+
+The next table provides the accuracy measures of the six models.  
+
+```{r acc_table, include = FALSE, fig.align='center',fig.height=2,fig.width=8, fig.show='hold'}
+my_acc_table <- knitr::kable(data.frame(accuracy_estimate = c("Normalized", "PCA"),
+                           Multinomial = c(mr_n_acc_est, mr_pca_acc_est),
+                           Tree = c(tree_n_acc_est, tree_pca_acc_est),
+                           Random_Forest = c(randf_n_acc_est,randf_pca_acc_est)),
+                           caption = "Accuracy")
+```  
+`r my_acc_table`  
+
+From this table we see that the normalized random forest model is predicted to have a 99.0% accuracy on the validation data.  
+
+# Test the predictors:  
+```{r validate, include = FALSE}
+## Test normalized Random Forest model
+final_predict <- 
+        predict(randf_fit_n, new_data = validation) %>%
+        bind_cols(predict(randf_fit_n, validation),
+                  predict(randf_fit_n, validation, type = "prob"))
+
+final_results <-
+        knitr::kable(final_predict)
+```  
+
+Given below is the normalized random forest model applied to the validation data set:  
+`r final_results`
+
+Conclusion: Even though the final results do given a 100% correct prediction on the validation data. The extremely high ROC value of the normalized random forest method should prompt the necessity to re-run the code using different re-sampling methods.  
+
+# Appendix: r code   
+```{r ref.label=knitr::all_labels(), echo = T, eval = F}
+
+```
